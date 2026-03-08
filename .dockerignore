@@ -1,0 +1,8 @@
+.git
+.gitignore
+Dockerfile
+.dockerignore
+build
+data
+uploads
+.gradle
