@@ -7,6 +7,7 @@ import ian.choe.tcgauction.repository.AuctionRepository;
 import ian.choe.tcgauction.repository.BidRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
@@ -26,6 +27,7 @@ public class AuctionService {
 
     private final AuctionRepository auctionRepository;
     private final BidRepository bidRepository;
+    private final SimpMessagingTemplate messagingTemplate;
 
     @Value("${app.upload-dir}")
     private String uploadDir;
@@ -122,12 +124,18 @@ public class AuctionService {
         bid.setBidAmount(bidAmount);
         bidRepository.save(bid);
 
-        return BidDto.builder()
+        BidDto bidDto = BidDto.builder()
                 .id(bid.getId())
                 .bidder(bid.getBidder())
                 .bidAmount(bid.getBidAmount())
                 .createdAt(bid.getCreatedAt())
                 .build();
+
+        // [WEBSOCKET] 입찰 발생 시 해당 경매를 구독 중인 클라이언트에게 전체 상세 정보 브로드캐스트
+        getAuctionDetail(auctionId)
+                .ifPresent(detail -> messagingTemplate.convertAndSend("/topic/auction/" + auctionId, detail));
+
+        return bidDto;
     }
 
     private String saveImage(MultipartFile image) throws IOException {

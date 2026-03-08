@@ -1,13 +1,51 @@
 // =============================================
 // TCG Auction — Single Page Application (Vanilla JS)
+// WebSocket (STOMP/SockJS) 버전
 // =============================================
 
 const app = document.getElementById('app');
 
-// ---- Polling ----
-let pollingTimer = null;
-function stopPolling() {
-  if (pollingTimer) { clearInterval(pollingTimer); pollingTimer = null; }
+// ---- WebSocket ----
+let stompClient = null;
+let currentSubscription = null;
+
+function connectWebSocket(onConnected) {
+  if (stompClient && stompClient.connected) {
+    if (onConnected) onConnected();
+    return;
+  }
+  const socket = new SockJS('/ws');
+  stompClient = Stomp.over(socket);
+  stompClient.debug = null; // 콘솔 로그 끄기
+  stompClient.connect({}, () => {
+    console.log('[WS] Connected');
+    if (onConnected) onConnected();
+  }, (error) => {
+    console.error('[WS] Connection error:', error);
+    stompClient = null;
+    // 3초 후 재연결 시도
+    setTimeout(() => connectWebSocket(onConnected), 3000);
+  });
+}
+
+function subscribeToAuction(auctionId, callback) {
+  unsubscribeAll();
+  if (!stompClient || !stompClient.connected) {
+    connectWebSocket(() => subscribeToAuction(auctionId, callback));
+    return;
+  }
+  currentSubscription = stompClient.subscribe(`/topic/auction/${auctionId}`, (message) => {
+    const data = JSON.parse(message.body);
+    callback(data);
+  });
+  console.log(`[WS] Subscribed to /topic/auction/${auctionId}`);
+}
+
+function unsubscribeAll() {
+  if (currentSubscription) {
+    currentSubscription.unsubscribe();
+    currentSubscription = null;
+  }
 }
 
 // ---- Helpers ----
@@ -60,7 +98,7 @@ function headerHTML(user) {
 
 // ---- Router ----
 function navigate(page, param) {
-  stopPolling(); // 페이지 이동 시 기존 폴링 중지
+  unsubscribeAll(); // 페이지 이동 시 기존 구독 해제
   const user = getUser();
   if (!user && page !== 'login') { renderLogin(); return; }
   switch (page) {
@@ -101,7 +139,8 @@ function renderLogin() {
     const name = input.value.trim();
     if (!name) return;
     setUser(name);
-    navigate('list');
+    // 로그인 시 WebSocket 연결
+    connectWebSocket(() => navigate('list'));
   });
 }
 
@@ -162,46 +201,6 @@ async function renderList() {
     document.getElementById('auction-content').innerHTML =
       `<div class="empty-state"><p>경매 목록을 불러오는 데 실패했습니다.</p></div>`;
   }
-
-  // [POLLING] 목록 페이지: 10초마다 경매 목록 갱신
-  pollingTimer = setInterval(async () => {
-    try {
-      const r = await fetch('/api/auctions');
-      const freshAuctions = await r.json();
-      const container = document.getElementById('auction-content');
-      if (!container) { stopPolling(); return; }
-
-      if (freshAuctions.length === 0) {
-        container.innerHTML = `
-                    <div class="empty-state">
-                      <span class="emoji">📭</span>
-                      <p>아직 등록된 경매가 없습니다</p>
-                      <button class="btn btn-primary" onclick="navigate('create')">첫 경매를 등록해 보세요!</button>
-                    </div>`;
-        return;
-      }
-
-      container.innerHTML = `<div class="auction-grid">${freshAuctions.map(a => {
-        const st = getAuctionStatus(a);
-        return `
-                    <div class="auction-card" onclick="navigate('detail', ${a.id})">
-                      ${a.imagePath
-            ? `<img src="${a.imagePath}" alt="${a.title}" class="auction-card-image">`
-            : `<div class="auction-card-image-placeholder">🃏</div>`}
-                      <div class="auction-card-body">
-                        <div class="auction-card-title">${a.title}</div>
-                        <div class="auction-card-meta">
-                          <div class="auction-card-price"><small>현재가</small>${formatPrice(a.currentPrice)}</div>
-                          <div class="auction-card-info">
-                            <div class="bids">${a.bidCount}건 입찰</div>
-                            <span class="time ${st.className}">${st.label}</span>
-                          </div>
-                        </div>
-                      </div>
-                    </div>`;
-      }).join('')}</div>`;
-    } catch (e) { /* 폴링 실패 무시 */ }
-  }, 10000);
 }
 
 // ---- Auction Create Page ----
@@ -340,194 +339,201 @@ async function renderDetail(auctionId) {
     }
 
     const auction = await res.json();
-    const status = getAuctionStatus(auction);
-    const bids = auction.bids || [];
-    const currentPrice = bids.length > 0 ? bids[0].bidAmount : auction.startingPrice;
-    const minBid = currentPrice + auction.bidUnit;
+    renderDetailContent(auction, user, auctionId);
 
-    let bidsHTML = '';
-    if (bids.length > 0) {
-      bidsHTML = bids.map((b, i) => `
-        <div class="bid-item">
-          <div class="bid-amount">${formatPrice(b.bidAmount)}</div>
-          <div class="bid-info">
-            <div class="bid-bidder">${i === 0 ? '👑 ' : ''}${b.bidder}</div>
-            <div class="bid-time">${formatDate(b.createdAt)}</div>
-          </div>
-        </div>
-      `).join('');
-      bidsHTML += `
-        <div class="starting-price-item">
-          <div class="bid-amount">${formatPrice(auction.startingPrice)}</div>
-          <div class="bid-info"><div class="bid-bidder">시작가</div></div>
-        </div>
-      `;
-    } else {
-      bidsHTML = `<div style="padding:20px;text-align:center;color:var(--text-muted)">아직 입찰이 없습니다</div>`;
-    }
-
-    let bidFormHTML = '';
-    if (status.canBid && user !== auction.seller) {
-      bidFormHTML = `
-        <div class="bid-form">
-          <h3>💰 입찰하기</h3>
-          <form id="bid-form">
-            <div class="bid-form-row">
-              <div class="form-group">
-                <label for="bid-amount">입찰 금액 (원)</label>
-                <input id="bid-amount" type="number" class="form-input"
-                  placeholder="${minBid.toLocaleString()}" min="${minBid}" step="${auction.bidUnit}">
-              </div>
-              <button type="submit" class="btn btn-primary" id="bid-btn" style="height:50px;min-width:120px">입찰하기</button>
-            </div>
-            <div class="bid-min-info">최소 입찰가: ${formatPrice(minBid)} (현재가 + 입찰 단위)</div>
-            <div id="bid-message"></div>
-          </form>
-        </div>
-      `;
-    } else if (user === auction.seller) {
-      bidFormHTML = `<div class="bid-form" style="text-align:center;color:var(--text-secondary)"><p>내가 등록한 경매입니다</p></div>`;
-    } else if (!status.canBid && status.label === '종료') {
-      bidFormHTML = `<div class="bid-form" style="text-align:center;color:var(--text-muted)"><p>이 경매는 종료되었습니다</p></div>`;
-    }
-
-    app.innerHTML = headerHTML(user) + `
-      <div class="detail-page fade-up">
-        ${auction.imagePath
-        ? `<div class="detail-image-wrapper"><img src="${auction.imagePath}" alt="${auction.title}"></div>`
-        : `<div class="detail-image-placeholder">🃏</div>`}
-
-        <div class="detail-header">
-          <h1>${auction.title}</h1>
-          <span class="detail-status ${status.className}">${status.label}</span>
-        </div>
-
-        <div class="detail-info-grid">
-          <div class="detail-info-item"><div class="label">현재가</div><div class="value price">${formatPrice(currentPrice)}</div></div>
-          <div class="detail-info-item"><div class="label">시작가</div><div class="value">${formatPrice(auction.startingPrice)}</div></div>
-          <div class="detail-info-item"><div class="label">입찰 단위</div><div class="value">${formatPrice(auction.bidUnit)}</div></div>
-          <div class="detail-info-item"><div class="label">입찰 횟수</div><div class="value">${bids.length}건</div></div>
-          <div class="detail-info-item"><div class="label">시작일</div><div class="value" style="font-size:14px">${formatDate(auction.startDate)}</div></div>
-          <div class="detail-info-item"><div class="label">종료일</div><div class="value" style="font-size:14px">${formatDate(auction.endDate)}</div></div>
-        </div>
-
-        ${auction.description ? `<div class="detail-description"><h3>📋 설명</h3>${auction.description}</div>` : ''}
-
-        <div class="detail-info-item" style="margin-bottom:32px">
-          <div class="label">판매자</div><div class="value">👤 ${auction.seller}</div>
-        </div>
-
-        <div class="bid-section">
-          <h3>📊 입찰 내역</h3>
-          <div class="bid-list">${bidsHTML}</div>
-        </div>
-
-        ${bidFormHTML}
-      </div>
-    `;
-
-    // Bid form handler
-    const bidForm = document.getElementById('bid-form');
-    if (bidForm) {
-      bidForm.addEventListener('submit', async (ev) => {
-        ev.preventDefault();
-        const btn = document.getElementById('bid-btn');
-        const msgDiv = document.getElementById('bid-message');
-        const amountInput = document.getElementById('bid-amount');
-        const amount = parseInt(amountInput.value);
-
-        if (!amount || amount < minBid) {
-          msgDiv.innerHTML = `<div class="bid-error">⚠️ 최소 입찰가는 ${formatPrice(minBid)} 입니다.</div>`;
-          return;
-        }
-
-        btn.disabled = true;
-        btn.textContent = '입찰 중...';
-        msgDiv.innerHTML = '';
-
-        try {
-          const r = await fetch(`/api/auctions/${auctionId}/bid`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ bidder: user, bidAmount: amount })
-          });
-          const data = await r.json();
-          if (!r.ok) {
-            msgDiv.innerHTML = `<div class="bid-error">⚠️ ${data.error}</div>`;
-          } else {
-            msgDiv.innerHTML = `<div class="bid-success">✅ 입찰이 완료되었습니다! 🎉</div>`;
-            setTimeout(() => renderDetail(auctionId), 800);
-          }
-        } catch (err) {
-          msgDiv.innerHTML = `<div class="bid-error">⚠️ 입찰 중 오류가 발생했습니다.</div>`;
-        } finally {
-          btn.disabled = false;
-          btn.textContent = '입찰하기';
-        }
-      });
-    }
-
-    // [POLLING] 상세 페이지: 5초마다 입찰 내역 갱신 (부분 업데이트)
-    pollingTimer = setInterval(async () => {
-      try {
-        const r = await fetch(`/api/auctions/${auctionId}`);
-        if (!r.ok) return;
-        const fresh = await r.json();
-        const freshBids = fresh.bids || [];
-
-        // 입찰 수가 같으면 변경 없음 → 스킵
-        if (freshBids.length === bids.length) return;
-
-        // 현재가, 최소 입찰가 업데이트
-        const newCurrentPrice = freshBids.length > 0 ? freshBids[0].bidAmount : fresh.startingPrice;
-        const newMinBid = newCurrentPrice + fresh.bidUnit;
-
-        // 가격 정보 업데이트
-        const priceEl = document.querySelector('.detail-info-item .value.price');
-        if (priceEl) priceEl.textContent = formatPrice(newCurrentPrice);
-
-        const bidCountEl = document.querySelectorAll('.detail-info-item .value')[3];
-        if (bidCountEl) bidCountEl.textContent = freshBids.length + '건';
-
-        // 입찰 내역 업데이트
-        const bidListEl = document.querySelector('.bid-list');
-        if (bidListEl) {
-          let newBidsHTML = freshBids.map((b, i) => `
-                        <div class="bid-item">
-                          <div class="bid-amount">${formatPrice(b.bidAmount)}</div>
-                          <div class="bid-info">
-                            <div class="bid-bidder">${i === 0 ? '👑 ' : ''}${b.bidder}</div>
-                            <div class="bid-time">${formatDate(b.createdAt)}</div>
-                          </div>
-                        </div>`).join('');
-          newBidsHTML += `
-                        <div class="starting-price-item">
-                          <div class="bid-amount">${formatPrice(fresh.startingPrice)}</div>
-                          <div class="bid-info"><div class="bid-bidder">시작가</div></div>
-                        </div>`;
-          bidListEl.innerHTML = newBidsHTML;
-        }
-
-        // 입찰 폼의 최소가 업데이트 (입력 중인 값은 유지)
-        const bidAmountInput = document.getElementById('bid-amount');
-        if (bidAmountInput) {
-          bidAmountInput.min = newMinBid;
-          bidAmountInput.step = fresh.bidUnit;
-          bidAmountInput.placeholder = newMinBid.toLocaleString();
-        }
-        const minInfoEl = document.querySelector('.bid-min-info');
-        if (minInfoEl) minInfoEl.textContent = `최소 입찰가: ${formatPrice(newMinBid)} (현재가 + 입찰 단위)`;
-
-        // 내부 상태 동기화
-        bids.length = 0;
-        freshBids.forEach(b => bids.push(b));
-      } catch (e) { /* 폴링 실패 무시 */ }
-    }, 5000);
+    // [WEBSOCKET] 해당 경매를 구독하여 실시간 업데이트 받기
+    subscribeToAuction(auctionId, (freshAuction) => {
+      console.log(`[WS] Received update for auction ${auctionId}`);
+      updateDetailDOM(freshAuction);
+    });
 
   } catch (err) {
     console.error(err);
   }
 }
 
+// 상세 페이지 전체 렌더링
+function renderDetailContent(auction, user, auctionId) {
+  const status = getAuctionStatus(auction);
+  const bids = auction.bids || [];
+  const currentPrice = bids.length > 0 ? bids[0].bidAmount : auction.startingPrice;
+  const minBid = currentPrice + auction.bidUnit;
+
+  let bidsHTML = '';
+  if (bids.length > 0) {
+    bidsHTML = bids.map((b, i) => `
+      <div class="bid-item">
+        <div class="bid-amount">${formatPrice(b.bidAmount)}</div>
+        <div class="bid-info">
+          <div class="bid-bidder">${i === 0 ? '👑 ' : ''}${b.bidder}</div>
+          <div class="bid-time">${formatDate(b.createdAt)}</div>
+        </div>
+      </div>
+    `).join('');
+    bidsHTML += `
+      <div class="starting-price-item">
+        <div class="bid-amount">${formatPrice(auction.startingPrice)}</div>
+        <div class="bid-info"><div class="bid-bidder">시작가</div></div>
+      </div>
+    `;
+  } else {
+    bidsHTML = `<div style="padding:20px;text-align:center;color:var(--text-muted)">아직 입찰이 없습니다</div>`;
+  }
+
+  let bidFormHTML = '';
+  if (status.canBid && user !== auction.seller) {
+    bidFormHTML = `
+      <div class="bid-form">
+        <h3>💰 입찰하기</h3>
+        <form id="bid-form">
+          <div class="bid-form-row">
+            <div class="form-group">
+              <label for="bid-amount">입찰 금액 (원)</label>
+              <input id="bid-amount" type="number" class="form-input"
+                placeholder="${minBid.toLocaleString()}" min="${minBid}" step="${auction.bidUnit}">
+            </div>
+            <button type="submit" class="btn btn-primary" id="bid-btn" style="height:50px;min-width:120px">입찰하기</button>
+          </div>
+          <div class="bid-min-info">최소 입찰가: ${formatPrice(minBid)} (현재가 + 입찰 단위)</div>
+          <div id="bid-message"></div>
+        </form>
+      </div>
+    `;
+  } else if (user === auction.seller) {
+    bidFormHTML = `<div class="bid-form" style="text-align:center;color:var(--text-secondary)"><p>내가 등록한 경매입니다</p></div>`;
+  } else if (!status.canBid && status.label === '종료') {
+    bidFormHTML = `<div class="bid-form" style="text-align:center;color:var(--text-muted)"><p>이 경매는 종료되었습니다</p></div>`;
+  }
+
+  app.innerHTML = headerHTML(user) + `
+    <div class="detail-page fade-up">
+      ${auction.imagePath
+      ? `<div class="detail-image-wrapper"><img src="${auction.imagePath}" alt="${auction.title}"></div>`
+      : `<div class="detail-image-placeholder">🃏</div>`}
+
+      <div class="detail-header">
+        <h1>${auction.title}</h1>
+        <span class="detail-status ${status.className}">${status.label}</span>
+      </div>
+
+      <div class="detail-info-grid">
+        <div class="detail-info-item"><div class="label">현재가</div><div class="value price" id="ws-current-price">${formatPrice(currentPrice)}</div></div>
+        <div class="detail-info-item"><div class="label">시작가</div><div class="value">${formatPrice(auction.startingPrice)}</div></div>
+        <div class="detail-info-item"><div class="label">입찰 단위</div><div class="value">${formatPrice(auction.bidUnit)}</div></div>
+        <div class="detail-info-item"><div class="label">입찰 횟수</div><div class="value" id="ws-bid-count">${bids.length}건</div></div>
+        <div class="detail-info-item"><div class="label">시작일</div><div class="value" style="font-size:14px">${formatDate(auction.startDate)}</div></div>
+        <div class="detail-info-item"><div class="label">종료일</div><div class="value" style="font-size:14px">${formatDate(auction.endDate)}</div></div>
+      </div>
+
+      ${auction.description ? `<div class="detail-description"><h3>📋 설명</h3>${auction.description}</div>` : ''}
+
+      <div class="detail-info-item" style="margin-bottom:32px">
+        <div class="label">판매자</div><div class="value">👤 ${auction.seller}</div>
+      </div>
+
+      <div class="bid-section">
+        <h3>📊 입찰 내역</h3>
+        <div class="bid-list" id="ws-bid-list">${bidsHTML}</div>
+      </div>
+
+      ${bidFormHTML}
+    </div>
+  `;
+
+  // Bid form handler
+  const bidForm = document.getElementById('bid-form');
+  if (bidForm) {
+    bidForm.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const btn = document.getElementById('bid-btn');
+      const msgDiv = document.getElementById('bid-message');
+      const amountInput = document.getElementById('bid-amount');
+      const amount = parseInt(amountInput.value);
+
+      const currentMin = parseInt(amountInput.min) || minBid;
+      if (!amount || amount < currentMin) {
+        msgDiv.innerHTML = `<div class="bid-error">⚠️ 최소 입찰가는 ${formatPrice(currentMin)} 입니다.</div>`;
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = '입찰 중...';
+      msgDiv.innerHTML = '';
+
+      try {
+        const r = await fetch(`/api/auctions/${auctionId}/bid`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bidder: user, bidAmount: amount })
+        });
+        const data = await r.json();
+        if (!r.ok) {
+          msgDiv.innerHTML = `<div class="bid-error">⚠️ ${data.error}</div>`;
+        } else {
+          msgDiv.innerHTML = `<div class="bid-success">✅ 입찰이 완료되었습니다! 🎉</div>`;
+          amountInput.value = '';
+          // WebSocket이 자동으로 업데이트해 줌 — 수동 새로고침 불필요
+        }
+      } catch (err) {
+        msgDiv.innerHTML = `<div class="bid-error">⚠️ 입찰 중 오류가 발생했습니다.</div>`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '입찰하기';
+      }
+    });
+  }
+}
+
+// [WEBSOCKET] 상세 페이지 부분 DOM 업데이트 (입찰 내역, 가격, 최소가만 갱신)
+function updateDetailDOM(fresh) {
+  const bids = fresh.bids || [];
+  const currentPrice = bids.length > 0 ? bids[0].bidAmount : fresh.startingPrice;
+  const newMinBid = currentPrice + fresh.bidUnit;
+
+  // 현재가 업데이트
+  const priceEl = document.getElementById('ws-current-price');
+  if (priceEl) priceEl.textContent = formatPrice(currentPrice);
+
+  // 입찰 횟수 업데이트
+  const countEl = document.getElementById('ws-bid-count');
+  if (countEl) countEl.textContent = bids.length + '건';
+
+  // 입찰 내역 업데이트
+  const bidListEl = document.getElementById('ws-bid-list');
+  if (bidListEl) {
+    if (bids.length > 0) {
+      let html = bids.map((b, i) => `
+        <div class="bid-item">
+          <div class="bid-amount">${formatPrice(b.bidAmount)}</div>
+          <div class="bid-info">
+            <div class="bid-bidder">${i === 0 ? '👑 ' : ''}${b.bidder}</div>
+            <div class="bid-time">${formatDate(b.createdAt)}</div>
+          </div>
+        </div>`).join('');
+      html += `
+        <div class="starting-price-item">
+          <div class="bid-amount">${formatPrice(fresh.startingPrice)}</div>
+          <div class="bid-info"><div class="bid-bidder">시작가</div></div>
+        </div>`;
+      bidListEl.innerHTML = html;
+    }
+  }
+
+  // 입찰 폼 최소가 업데이트 (입력 중인 값은 유지)
+  const bidAmountInput = document.getElementById('bid-amount');
+  if (bidAmountInput) {
+    bidAmountInput.min = newMinBid;
+    bidAmountInput.step = fresh.bidUnit;
+    bidAmountInput.placeholder = newMinBid.toLocaleString();
+  }
+  const minInfoEl = document.querySelector('.bid-min-info');
+  if (minInfoEl) minInfoEl.textContent = `최소 입찰가: ${formatPrice(newMinBid)} (현재가 + 입찰 단위)`;
+}
+
 // ---- Init ----
-navigate(getUser() ? 'list' : 'login');
+// WebSocket 사전 연결 (로그인 된 경우)
+if (getUser()) {
+  connectWebSocket(() => navigate('list'));
+} else {
+  navigate('login');
+}
