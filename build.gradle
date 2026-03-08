@@ -9,8 +9,9 @@ version = '0.0.1-SNAPSHOT'
 description = 'tcgauction'
 
 java {
-    sourceCompatibility = '17'
-    targetCompatibility = '17'
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
 }
 
 configurations {
